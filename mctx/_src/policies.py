@@ -33,10 +33,8 @@ def muzero_policy(
     root: base.RootFnOutput,
     recurrent_fn: base.RecurrentFn,
     num_simulations: int,
-    tree: Optional[search.Tree] = None,
     invalid_actions: Optional[chex.Array] = None,
     max_depth: Optional[int] = None,
-    max_nodes: Optional[int] = None,
     loop_fn: base.LoopFn = jax.lax.fori_loop,
     *,
     qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
@@ -60,14 +58,9 @@ def muzero_policy(
       `(params, rng_key, action, embedding)` and returns a `RecurrentFnOutput`
       and the new state embedding. The `rng_key` argument is consumed.
     num_simulations: the number of simulations.
-    tree: a pre-initialized search tree. If given, search will continue to 
-    expand the tree. If not given, a new tree will be initialized.
     invalid_actions: a mask with invalid actions. Invalid actions
       have ones, valid actions have zeros in the mask. Shape `[B, num_actions]`.
     max_depth: maximum search tree depth allowed during simulation.
-    max_nodes: maximum number of nodes allowed in the search tree. If `None`,
-      max_nodes == num_simulations + 1. This only applies when `tree` is `None` 
-      (i.e. when a new tree is initialized).
     loop_fn: Function used to run the simulations. It may be required to pass
       hk.fori_loop if using this function inside a Haiku module.
     qtransform: function to obtain completed Q-values for a node.
@@ -108,15 +101,16 @@ def muzero_policy(
   search_tree = search.search(
       params=params,
       rng_key=search_rng_key,
-      root=root,
+      tree=search.instantiate_tree_from_root(
+        root, num_simulations+1,
+        root_invalid_actions=invalid_actions,
+        extra_data=None
+      ),
       recurrent_fn=recurrent_fn,
       root_action_selection_fn=root_action_selection_fn,
       interior_action_selection_fn=interior_action_selection_fn,
       num_simulations=num_simulations,
-      max_nodes=max_nodes,
-      tree=tree,
       max_depth=max_depth,
-      invalid_actions=invalid_actions,
       loop_fn=loop_fn)
 
   # Sampling the proposed action proportionally to the visit counts.
@@ -193,12 +187,21 @@ def gumbel_muzero_policy(
   gumbel = gumbel_scale * jax.random.gumbel(
       gumbel_rng, shape=root.prior_logits.shape, dtype=root.prior_logits.dtype)
 
-  # Searching.
+
   extra_data = action_selection.GumbelMuZeroExtraData(root_gumbel=gumbel)
+  # Searching.
+  search_tree = search.instantiate_tree_from_root(
+      root, num_simulations+1,
+      root_invalid_actions=invalid_actions,
+      extra_data=extra_data)
   search_tree = search.search(
       params=params,
       rng_key=rng_key,
-      root=root,
+      tree=search.instantiate_tree_from_root(
+        root, num_simulations+1,
+        root_invalid_actions=invalid_actions,
+        extra_data=extra_data
+      ),
       recurrent_fn=recurrent_fn,
       root_action_selection_fn=functools.partial(
           action_selection.gumbel_muzero_root_action_selection,
@@ -212,8 +215,6 @@ def gumbel_muzero_policy(
       ),
       num_simulations=num_simulations,
       max_depth=max_depth,
-      invalid_actions=invalid_actions,
-      extra_data=extra_data,
       loop_fn=loop_fn)
   summary = search_tree.summary()
 
@@ -234,6 +235,120 @@ def gumbel_muzero_policy(
   completed_search_logits = _mask_invalid_actions(
       root.prior_logits + completed_qvalues, invalid_actions)
   action_weights = jax.nn.softmax(completed_search_logits)
+  return base.PolicyOutput(
+      action=action,
+      action_weights=action_weights,
+      search_tree=search_tree)
+
+
+def alphazero_policy(
+    params: base.Params,
+    rng_key: chex.PRNGKey,
+    root: base.RootFnOutput,
+    recurrent_fn: base.RecurrentFn,
+    num_simulations: int,
+    search_tree: Optional[search.Tree] = None,
+    max_nodes: Optional[int] = None,
+    invalid_actions: Optional[chex.Array] = None,
+    max_depth: Optional[int] = None,
+    loop_fn: base.LoopFn = jax.lax.fori_loop,
+    *,
+    qtransform: base.QTransform = qtransforms.qtransform_by_parent_and_siblings,
+    dirichlet_fraction: chex.Numeric = 0.25,
+    dirichlet_alpha: chex.Numeric = 0.3,
+    pb_c_init: chex.Numeric = 1.25,
+    pb_c_base: chex.Numeric = 19652,
+    temperature: chex.Numeric = 1.0) -> base.PolicyOutput[None]:
+  """Runs AlphaZero search and returns the `PolicyOutput`.
+
+  In the shape descriptions, `B` denotes the batch dimension.
+
+  Args:
+    params: params to be forwarded to root and recurrent functions.
+    rng_key: random number generator state, the key is consumed.
+    root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
+      `prior_logits` are from a policy network. The shapes are
+      `([B, num_actions], [B], [B, ...])`, respectively.
+    recurrent_fn: a callable to be called on the leaf nodes and unvisited
+      actions retrieved by the simulation step, which takes as args
+      `(params, rng_key, action, embedding)` and returns a `RecurrentFnOutput`
+      and the new state embedding. The `rng_key` argument is consumed.
+    num_simulations: the number of simulations.
+    search_tree: If provided, continue the search from this tree. If not
+      provided, a new tree with capacity `max_nodes` is created.
+    max_nodes: Specifies the capacity to initialize the search tree with, if
+      `search_tree` is not provided.
+    invalid_actions: a mask with invalid actions. Invalid actions
+      have ones, valid actions have zeros in the mask. Shape `[B, num_actions]`.
+    max_depth: maximum search tree depth allowed during simulation.
+    loop_fn: Function used to run the simulations. It may be required to pass
+      hk.fori_loop if using this function inside a Haiku module.
+    qtransform: function to obtain completed Q-values for a node.
+    dirichlet_fraction: float from 0 to 1 interpolating between using only the
+      prior policy or just the Dirichlet noise.
+    dirichlet_alpha: concentration parameter to parametrize the Dirichlet
+      distribution.
+    pb_c_init: constant c_1 in the PUCT formula.
+    pb_c_base: constant c_2 in the PUCT formula.
+    temperature: temperature for acting proportionally to
+      `visit_counts**(1 / temperature)`.
+
+  Returns:
+    `PolicyOutput` containing the proposed action, action_weights and the used
+    search tree.
+  """
+  rng_key, dirichlet_rng_key, search_rng_key = jax.random.split(rng_key, 3)
+
+  # Adding Dirichlet noise.
+  noisy_logits = _get_logits_from_probs(
+      _add_dirichlet_noise(
+          dirichlet_rng_key,
+          jax.nn.softmax(root.prior_logits),
+          dirichlet_fraction=dirichlet_fraction,
+          dirichlet_alpha=dirichlet_alpha))
+  root = root.replace(
+      prior_logits=_mask_invalid_actions(noisy_logits, invalid_actions))
+
+  # Running the search.
+  interior_action_selection_fn = functools.partial(
+      action_selection.muzero_action_selection,
+      pb_c_base=pb_c_base,
+      pb_c_init=pb_c_init,
+      qtransform=qtransform)
+  root_action_selection_fn = functools.partial(
+      interior_action_selection_fn,
+      depth=0)
+
+  if search_tree is None:
+    if max_nodes is None:
+      max_nodes = num_simulations + 1
+    search_tree = search.instantiate_tree_from_root(
+        root, max_nodes,
+        root_invalid_actions=invalid_actions,
+        extra_data=None
+    )
+  else:
+    search_tree = search.update_tree_with_root(
+        search_tree, root,
+        root_invalid_actions=invalid_actions, extra_data=None)
+
+  search_tree = search.search(
+      params=params,
+      rng_key=search_rng_key,
+      tree=search_tree,
+      recurrent_fn=recurrent_fn,
+      root_action_selection_fn=root_action_selection_fn,
+      interior_action_selection_fn=interior_action_selection_fn,
+      num_simulations=num_simulations,
+      max_depth=max_depth,
+      loop_fn=loop_fn)
+
+  # Sampling the proposed action proportionally to the visit counts.
+  summary = search_tree.summary()
+  action_weights = summary.visit_probs
+  action_logits = _apply_temperature(
+      _get_logits_from_probs(action_weights), temperature)
+  action = jax.random.categorical(rng_key, action_logits)
   return base.PolicyOutput(
       action=action,
       action_weights=action_weights,
@@ -357,16 +472,19 @@ def stochastic_muzero_policy(
   root_action_selection_fn = functools.partial(
       interior_action_selection_fn, depth=0)
 
+  search_tree = search.instantiate_tree_from_root(
+        root, num_simulations+1,
+        root_invalid_actions=invalid_actions,
+        extra_data=None)
   search_tree = search.search(
       params=params,
       rng_key=search_rng_key,
-      root=root,
+      tree=search_tree,
       recurrent_fn=recurrent_fn,
       root_action_selection_fn=root_action_selection_fn,
       interior_action_selection_fn=interior_action_selection_fn,
       num_simulations=num_simulations,
       max_depth=max_depth,
-      invalid_actions=invalid_actions,
       loop_fn=loop_fn)
 
   # Sampling the proposed action proportionally to the visit counts.
