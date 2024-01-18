@@ -29,13 +29,13 @@ tree = policy_output.search_tree
 action = policy_output.action
 
 # extract the subtree corresponding to the chosen action
-tree = get_subtree(tree, action)
+tree = mctx.get_subtree(tree, action)
 
 # go to next environment state
 env_state = env.step(env_state, action)
 
 # reset the search tree where the environment has terminated
-tree = reset_search_tree(tree, env_state.terminated)
+tree = mctx.reset_search_tree(tree, env_state.terminated)
 
 # new search with subtree
 # (max_nodes has no effect when a tree is passed) 
@@ -51,6 +51,11 @@ room left for `num_simulations` new nodes.
 In the case where a tree is full, values and visit counts are still propagated backwards to all nodes along the visit path
 as they would if the expansion was in bounds. However, a new node is not created and stored in the search tree, only its 
 in-bounds predecessors are updated.
+
+## Examples
+The mctx readme links to a simple Connect4 example: https://github.com/Carbon225/mctx-classic
+
+I modified this example to demonstrate the use of `alphazero_policy` and `get_subtree`. You can see it [here](https://github.com/lowrollr/mctx-az/blob/main/connect4.ipynb)
 
 ## Issues
 If you run into problems or need help, please create an Issue and I will do my best to assist you promptly.
