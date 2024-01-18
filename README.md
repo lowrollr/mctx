@@ -52,3 +52,5 @@ In the case where a tree is full, values and visit counts are still propagated b
 as they would if the expansion was in bounds. However, a new node is not created and stored in the search tree, only its 
 in-bounds predecessors are updated.
 
+## Issues
+If you run into problems or need help, please create an Issue and I will do my best to assist you promptly.
