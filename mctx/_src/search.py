@@ -31,17 +31,13 @@ T = TypeVar("T")
 def search(
     params: base.Params,
     rng_key: chex.PRNGKey,
+    tree: Tree,
     *,
-    root: base.RootFnOutput,
     recurrent_fn: base.RecurrentFn,
     root_action_selection_fn: base.RootActionSelectionFn,
     interior_action_selection_fn: base.InteriorActionSelectionFn,
     num_simulations: int,
-    max_nodes: Optional[int] = None,
-    tree: Optional[Tree] = None,
     max_depth: Optional[int] = None,
-    invalid_actions: Optional[chex.Array] = None,
-    extra_data: Any = None,
     loop_fn: base.LoopFn = jax.lax.fori_loop) -> Tree:
   """Performs a full search and returns sampled actions.
 
@@ -50,9 +46,7 @@ def search(
   Args:
     params: params to be forwarded to root and recurrent functions.
     rng_key: random number generator state, the key is consumed.
-    root: a `(prior_logits, value, embedding)` `RootFnOutput`. The
-      `prior_logits` are from a policy network. The shapes are
-      `([B, num_actions], [B], [B, ...])`, respectively.
+    tree: the initialized MCTS tree state to search upon.
     recurrent_fn: a callable to be called on the leaf nodes and unvisited
       actions retrieved by the simulation step, which takes as args
       `(params, rng_key, action, embedding)` and returns a `RecurrentFnOutput`
@@ -63,15 +57,6 @@ def search(
     num_simulations: the number of simulations.
     max_depth: maximum search tree depth allowed during simulation, defined as
       the number of edges from the root to a leaf node.
-    max_nodes: maximum number of nodes allowed in the search tree (incl. root) 
-      If `None`, max_nodes == num_simulations + 1. This only applies when `tree` 
-      is `None` (i.e. when a new tree is initialized).
-    tree: the MCTS tree state to continue search from. If `None`, a new tree 
-      will be initialized.
-    invalid_actions: a mask with invalid actions at the root. In the
-      mask, invalid actions have ones, and valid actions have zeros.
-      Shape `[B, num_actions]`.
-    extra_data: extra data passed to `tree.extra_data`. Shape `[B, ...]`.
     loop_fn: Function used to run the simulations. It may be required to pass
       hk.fori_loop if using this function inside a Haiku module.
 
@@ -85,16 +70,11 @@ def search(
   )
 
   # Do simulation, expansion, and backward steps.
-  batch_size = root.value.shape[0]
+  batch_size = tree.node_visits.shape[0]
   batch_range = jnp.arange(batch_size)
-  if tree is not None:
-    max_nodes = tree.children_visits.shape[1]
-  if max_nodes is None:
-    max_nodes = num_simulations + 1
+  tree_capacity = tree.children_visits.shape[1]
   if max_depth is None:
-    max_depth = max_nodes - 1
-  if invalid_actions is None:
-    invalid_actions = jnp.zeros_like(root.prior_logits)
+    max_depth = tree_capacity - 1
 
   def body_fun(_, loop_state):
     rng_key, tree = loop_state
@@ -113,7 +93,7 @@ def search(
         action, next_node_index)
     # if next_node_index goes out of bounds (i.e. no room left for new nodes)
     # backward its (in-bounds) parent
-    out_of_bounds = next_node_index >= max_nodes
+    out_of_bounds = next_node_index >= tree_capacity
     next_node_index = jnp.where(out_of_bounds,
                                 parent_index,
                                 next_node_index)
@@ -124,16 +104,6 @@ def search(
                         jnp.logical_and(unvisited, (~out_of_bounds)))
     loop_state = rng_key, tree
     return loop_state
-
-  # Allocate all necessary storage.
-  if tree is None:
-    tree = instantiate_tree_from_root(root, max_nodes,
-                                      root_invalid_actions=invalid_actions,
-                                      extra_data=extra_data)
-  else:
-    tree = update_tree_with_root(tree, root,
-                                 root_invalid_actions=invalid_actions,
-                                 extra_data=extra_data)
 
   _, tree = loop_fn(
       0, num_simulations, body_fun, (rng_key, tree))
@@ -376,8 +346,8 @@ def update_tree_node(
 def instantiate_tree_from_root(
     root: base.RootFnOutput,
     num_nodes: int,
-    root_invalid_actions: chex.Array,
-    extra_data: Any) -> Tree:
+    extra_data: Any,
+    root_invalid_actions: Optional[chex.Array] = None) -> Tree:
   """Initializes tree state at search root."""
   chex.assert_rank(root.prior_logits, 2)
   batch_size, num_actions = root.prior_logits.shape
@@ -386,6 +356,9 @@ def instantiate_tree_from_root(
   data_dtype = root.value.dtype
   batch_node = (batch_size, num_nodes)
   batch_node_action = (batch_size, num_nodes, num_actions)
+
+  if root_invalid_actions is None:
+    root_invalid_actions = jnp.zeros_like(root.prior_logits)
 
   def _zeros(x):
     return jnp.zeros(batch_node + x.shape[1:], dtype=x.dtype)
@@ -420,14 +393,18 @@ def instantiate_tree_from_root(
 def update_tree_with_root(
     tree: Tree,
     root: base.RootFnOutput,
-    root_invalid_actions: chex.Array,
-    extra_data: Any) -> Tree:
+    extra_data: Any,
+    root_invalid_actions: Optional[chex.Array] = None) -> Tree:
   """Given a tree, updates its root with the given root output 
   if it's not already populated."""
   root_uninitialized = tree.node_visits[:, Tree.ROOT_INDEX] == 0
   batch_size = tree_lib.infer_batch_size(tree)
   root_index = jnp.full([batch_size], Tree.ROOT_INDEX)
   ones = jnp.ones([batch_size], dtype=jnp.int32)
+
+  if root_invalid_actions is None:
+    root_invalid_actions = jnp.zeros_like(root.prior_logits)
+
   updates = dict(   # pylint: disable=use-dict-literal
       children_prior_logits=batch_update(
         tree.children_prior_logits, root.prior_logits, root_index),
