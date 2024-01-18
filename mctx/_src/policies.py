@@ -261,6 +261,10 @@ def alphazero_policy(
     temperature: chex.Numeric = 1.0) -> base.PolicyOutput[None]:
   """Runs AlphaZero search and returns the `PolicyOutput`.
 
+  Allows for continuing search from a provided `Tree` instance.
+  If no tree is provided, a new tree with capacity `max_nodes` is created.
+  This policy is otherwise identical to `muzero_policy`.
+
   In the shape descriptions, `B` denotes the batch dimension.
 
   Args:
